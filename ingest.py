@@ -1,131 +1,113 @@
-"""
-ingest.py — Atlas RAG Ingestion (runs on Pi 5)
-
-Reads PDF and text files from a local notes folder,
-splits them into chunks, and stores them in ChromaDB.
-
-Usage:
-    python3 ingest.py
-
-Put your .pdf and .txt files in the NOTES_FOLDER before running.
-"""
-
 import os
-import sys
+import chromadb
+from chromadb.utils import embedding_functions
+import PyPDF2
 
-# --- Config ---
-NOTES_FOLDER = os.environ.get("ATLAS_NOTES_FOLDER", "./notes")
-CHROMA_DIR = os.environ.get("ATLAS_CHROMA_DIR", "./chroma_db")
-CHUNK_SIZE = 500       # characters per chunk
-CHUNK_OVERLAP = 50     # overlap between chunks
-COLLECTION_NAME = "atlas_notes"
+# ── Config ──
+USB_BASE = "/media/admin"   # base path where USB drives mount
+CHUNK_SIZE = 500            # characters per chunk
+CHUNK_OVERLAP = 50          # overlap between chunks
+DB_PATH = "/home/admin/atlas_notes"
 
+def find_usb():
+    """Automatically find whatever USB drive is plugged in."""
+    if not os.path.exists(USB_BASE):
+        print(f"No media folder found at {USB_BASE}")
+        return None
+    drives = os.listdir(USB_BASE)
+    if not drives:
+        print("No USB drive detected. Plug one in and try again.")
+        return None
+    drive = os.path.join(USB_BASE, drives[0])
+    print(f"Found USB drive: {drive}")
+    return drive
 
-def read_text_file(filepath):
-    """Read a plain text file and return its content."""
-    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+def read_txt(path):
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
 
-
-def read_pdf_file(filepath):
-    """Read a PDF file and return extracted text."""
-    try:
-        import PyPDF2
-    except ImportError:
-        print("  [!] PyPDF2 not installed. Run: pip3 install PyPDF2")
-        return ""
-
+def read_pdf(path):
     text = ""
-    with open(filepath, "rb") as f:
-        reader = PyPDF2.PdfReader(f)
-        for i, page in enumerate(reader.pages):
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
+    try:
+        with open(path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                text += page.extract_text() or ""
+    except Exception as e:
+        print(f"Could not read PDF {path}: {e}")
     return text
 
-
-def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    """Split text into overlapping chunks."""
+def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     chunks = []
     start = 0
     while start < len(text):
-        end = start + chunk_size
+        end = start + size
         chunks.append(text[start:end])
-        start += chunk_size - overlap
-    return [c.strip() for c in chunks if c.strip()]
+        start += size - overlap
+    return chunks
 
+def ingest():
+    drive = find_usb()
+    if not drive:
+        return
 
-def main():
-    # Check notes folder exists
-    if not os.path.isdir(NOTES_FOLDER):
-        print(f"[!] Notes folder not found: {NOTES_FOLDER}")
-        print(f"    Creating it now. Add your .pdf and .txt files, then re-run.")
-        os.makedirs(NOTES_FOLDER, exist_ok=True)
-        sys.exit(0)
+    print(f"Scanning {drive} for notes...")
 
-    # Gather files
-    files = [f for f in os.listdir(NOTES_FOLDER)
-             if f.lower().endswith((".pdf", ".txt"))]
+    all_chunks = []
+    all_ids = []
+    all_metas = []
+    file_count = 0
 
-    if not files:
-        print(f"[!] No .pdf or .txt files found in {NOTES_FOLDER}")
-        print(f"    Add your class notes there and re-run.")
-        sys.exit(0)
+    for root, dirs, files in os.walk(drive):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            ext = fname.lower().split(".")[-1]
+            text = ""
 
-    print(f"[*] Found {len(files)} file(s) in {NOTES_FOLDER}")
+            if ext in ("txt", "md"):
+                print(f"  Reading: {fname}")
+                text = read_txt(fpath)
+            elif ext == "pdf":
+                print(f"  Reading: {fname}")
+                text = read_pdf(fpath)
+            else:
+                continue
 
-    # Import ChromaDB
+            if not text.strip():
+                print(f"  Skipping {fname} — empty or unreadable")
+                continue
+
+            chunks = chunk_text(text)
+            for i, chunk in enumerate(chunks):
+                chunk_id = f"{fname}-chunk-{i}"
+                all_chunks.append(chunk)
+                all_ids.append(chunk_id)
+                all_metas.append({"source": fname, "chunk": i})
+
+            file_count += 1
+
+    if not all_chunks:
+        print("No readable files found on USB drive.")
+        print("Supported types: .txt  .pdf  .md")
+        return
+
+    print(f"\nIngesting {len(all_chunks)} chunks from {file_count} file(s)...")
+
+    client = chromadb.PersistentClient(path=DB_PATH)
+    ef = embedding_functions.DefaultEmbeddingFunction()
+
+    # Clear old collection and rebuild fresh
     try:
-        import chromadb
-    except ImportError:
-        print("[!] ChromaDB not installed. Run: pip3 install chromadb")
-        sys.exit(1)
-
-    # Connect to ChromaDB
-    client = chromadb.PersistentClient(path=CHROMA_DIR)
-    # Delete old collection if it exists so we do a clean re-ingest
-    try:
-        client.delete_collection(COLLECTION_NAME)
-        print("[*] Cleared previous collection.")
-    except Exception:
+        client.delete_collection("notes")
+        print("Cleared old notes database.")
+    except:
         pass
-    collection = client.create_collection(COLLECTION_NAME)
 
-    total_chunks = 0
+    collection = client.create_collection("notes", embedding_function=ef)
+    collection.add(documents=all_chunks, ids=all_ids, metadatas=all_metas)
 
-    for filename in files:
-        filepath = os.path.join(NOTES_FOLDER, filename)
-        print(f"\n[*] Processing: {filename}")
-
-        # Read file
-        if filename.lower().endswith(".pdf"):
-            text = read_pdf_file(filepath)
-        else:
-            text = read_text_file(filepath)
-
-        if not text.strip():
-            print(f"  [!] No text extracted from {filename}, skipping.")
-            continue
-
-        # Chunk it
-        chunks = chunk_text(text)
-        print(f"  [+] Split into {len(chunks)} chunks")
-
-        # Add to ChromaDB
-        ids = [f"{filename}_chunk_{i}" for i in range(len(chunks))]
-        metadatas = [{"source": filename, "chunk_index": i} for i in range(len(chunks))]
-
-        collection.add(
-            documents=chunks,
-            ids=ids,
-            metadatas=metadatas
-        )
-        total_chunks += len(chunks)
-
-    print(f"\n[✓] Ingestion complete. {total_chunks} chunks stored in {CHROMA_DIR}")
-    print(f"    Collection: {COLLECTION_NAME}")
-
+    print(f"\nDone! {len(all_chunks)} chunks stored.")
+    print("Atlas can now answer questions from your notes.")
 
 if __name__ == "__main__":
-    main()
+    ingest()
